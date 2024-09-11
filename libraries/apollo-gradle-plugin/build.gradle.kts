@@ -1,3 +1,8 @@
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okio.buffer
+import okio.sink
+
 plugins {
   id("org.jetbrains.kotlin.jvm")
   id("java-gradle-plugin")
@@ -10,8 +15,6 @@ apolloLibrary(
     jvmTarget = 11 // AGP requires 11
 )
 
-// Configuration for extra jar to pass to R8 to give it more context about what can be relocated
-configurations.create("gr8Classpath")
 // Configuration dependencies that will be shadowed
 val shadeConfiguration = configurations.create("shade")
 
@@ -19,15 +22,7 @@ val shadeConfiguration = configurations.create("shade")
 val relocateJar = System.getenv("APOLLO_RELOCATE_JAR")?.toBoolean() ?: true
 
 dependencies {
-  /**
-   * OkHttp has some bytecode that checks for Conscrypt at runtime (https://github.com/square/okhttp/blob/71427d373bfd449f80178792fe231f60e4c972db/okhttp/src/main/kotlin/okhttp3/internal/platform/ConscryptPlatform.kt#L59)
-   * Put this in the classpath so that R8 knows it can relocate DisabledHostnameVerifier as the superclass is not package-private
-   *
-   * Keep in sync with https://github.com/square/okhttp/blob/71427d373bfd449f80178792fe231f60e4c972db/buildSrc/src/main/kotlin/deps.kt#L24
-   */
-  add("gr8Classpath", "org.conscrypt:conscrypt-openjdk-uber:2.5.2")
-
-  add("shade", project(":apollo-gradle-plugin-external"))
+  add(shadeConfiguration.name, project(":apollo-gradle-plugin-external"))
 
   testImplementation(project(":apollo-ast"))
   testImplementation(libs.junit)
@@ -49,55 +44,122 @@ dependencies {
 }
 
 if (relocateJar) {
-  gr8 {
-    val shadowedJar = create("shadow") {
-      proguardFile("rules.pro")
-      configuration("shade")
-      classPathConfiguration("gr8Classpath")
+  val embeddedJarFile = file("build/r8/embedded.jar")
+  val relocatedJarFile = file("build/r8/relocated.jar")
+  val r8File = file("build/r8/r8.jar")
 
-      exclude(".*MANIFEST.MF")
-      exclude("META-INF/versions/9/module-info\\.class")
-      exclude("META-INF/kotlin-stdlib.*\\.kotlin_module")
+  val embeddedJarTaskProvider = tasks.register("embeddeJar", Zip::class) {
+    /**
+     * TODO: configuration cache
+     */
+    from(shadeConfiguration.elements.map { fileSystemLocations ->
+      files().apply {
+        fileSystemLocations.forEach {
+          from(zipTree(it.asFile))
+        }
+      }
+    })
+    // The jar is mostly empty but this is needed for the plugin descriptor
+    from(tasks.jar.map { zipTree(it.outputs.files.singleFile) })
 
-      // Remove the following error:
-      // /Users/mbonnin/.m2/repository/com/apollographql/apollo/apollo-gradle-plugin/3.3.3-SNAPSHOT/apollo-gradle-plugin-3.3.3-SNAPSHOT.jar!/META-INF/kotlinpoet.kotlin_module:
-      // Module was compiled with an incompatible version of Kotlin. The binary version of its metadata is 1.7.1,
-      // expected version is 1.5.1.
-      exclude("META-INF/kotlinpoet.kotlin_module")
+    exclude("META-INF/MANIFEST.MF")
 
-      //Remove the following error:
-      // /Users/mbonnin/git/test-gradle-7-4/src/main/kotlin/Main.kt: (2, 5): Class 'kotlin.Unit' was compiled
-      // with an incompatible version of Kotlin. The binary version of its metadata is 1.7.1, expected version
-      // is 1.5.1.
-      exclude("kotlin/Unit.class")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
-      // Remove proguard rules from dependencies, we'll manage them ourselves
-      exclude("META-INF/proguard/.*")
-    }
-
-    // The java-gradle-plugin adds `gradleApi()` to the `api` implementation but it contains some JDK15 bytecode at
-    // org/gradle/internal/impldep/META-INF/versions/15/org/bouncycastle/jcajce/provider/asymmetric/edec/SignatureSpi$EdDSA.class:
-    // java.lang.IllegalArgumentException: Unsupported class file major version 59
-    // So remove it
-    val apiDependencies = project.configurations.getByName("api").dependencies
-    apiDependencies.firstOrNull {
-      it is FileCollectionDependency
-    }.let {
-      apiDependencies.remove(it)
-    }
-
-    configurations.named("compileOnly").configure {
-      extendsFrom(shadeConfiguration)
-    }
-    configurations.named("testImplementation").configure {
-      extendsFrom(shadeConfiguration)
-    }
-
-    replaceOutgoingJar2(shadowedJar)
+    destinationDirectory.set(embeddedJarFile.parentFile)
+    archiveFileName.set(embeddedJarFile.name)
   }
+
+  val downloadR8TaskProvider = tasks.register("downloadR8", DownloadR8Task::class.java) {
+    sha1 = "c3d27dec4e48f97502a83d440c987c7a54f46c7b"
+    outputFile.set(r8File)
+  }
+
+  val relocatedJarTaskProvider = tasks.register("relocateJar", JavaExec::class) {
+    dependsOn(embeddedJarTaskProvider)
+    debug = true
+    classpath(downloadR8TaskProvider)
+    mainClass.set("com.android.tools.r8.SwissArmyKnife")
+
+    args(
+        "relocator",
+        "--input",
+        embeddedJarFile.absolutePath,
+        "--output",
+        relocatedJarFile.absolutePath,
+        "--map",
+        "kotlin.Metadata->kotlin.Metadata",
+        "--map",
+        "kotlin.**->com.apollographql.relocated.kotlin",
+        "--map",
+        "org.objectweb.**->com.apollographql.relocated.org.objectweb",
+        "--map",
+        "org.jetbrains.**->com.apollographql.relocated.org.jetbrains",
+        "--map",
+        "org.intellij.**->com.apollographql.relocated.org.intellij",
+        "--map",
+        "kotlinx.**->com.apollographql.relocated.kotlinx",
+        "--map",
+        "okhttp3.**->com.apollographql.relocated.okhttp3",
+        "--map",
+        "com.squareup.**->com.apollographql.relocated.com.squareup",
+        "--map",
+        "com.benasher44.**->com.apollographql.relocated.com.benasher44",
+        "--map",
+        "okio.**->com.apollographql.relocated.com.okio",
+    )
+  }
+
+  configurations.named("compileOnly").configure {
+    extendsFrom(shadeConfiguration)
+  }
+  configurations.named("testImplementation").configure {
+    extendsFrom(shadeConfiguration)
+  }
+
+  replaceOutgoingJar2(relocatedJarTaskProvider.map { relocatedJarFile })
 } else {
   configurations.named("implementation").configure {
     extendsFrom(shadeConfiguration)
+  }
+}
+
+/**
+ * A task to download R8 from the Google servers
+ * Ideally, we should use a maven repository instead. Maven repositories usually give more
+ * immutability guarantees as well as easier caching. But `com.android.tools:r8:8.5.35` is
+ * minified and doesn't expose `SwissArmKnife`.
+ *
+ * On the bright side, using a commit from main allows easier updating/testing.
+ */
+abstract class DownloadR8Task: DefaultTask() {
+  @get:Input
+  abstract val sha1: Property<String>
+
+  @get:OutputFile
+  abstract val outputFile: RegularFileProperty
+
+  @TaskAction
+  fun taskAction() {
+    if (outputFile.get().asFile.exists()) {
+      return
+    }
+
+    val url = "https://storage.googleapis.com/r8-releases/raw/main/${sha1.get()}/r8.jar"
+    val request = Request.Builder()
+        .get()
+        .url(url)
+        .build()
+
+    OkHttpClient().newCall(request).execute().use { response ->
+      check(response.isSuccessful) {
+        "Cannot download $url (code=${response.code}): ${response.body?.string()}"
+      }
+
+      outputFile.get().asFile.outputStream().sink().buffer().use {
+        it.writeAll(response.body!!.source())
+      }
+    }
   }
 }
 
