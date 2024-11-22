@@ -100,7 +100,6 @@ if (relocateJar) {
     inputs.file(rulesFile)
     mainClass.set("com.android.tools.r8.R8")
 
-    args("--version")
     args("--release")
     args("--classfile")
     args("--output")
