@@ -1,3 +1,9 @@
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okio.buffer
+import okio.sink
+import org.jetbrains.intellij.platform.gradle.extensions.intellijPlatform
+
 plugins {
   id("org.jetbrains.kotlin.jvm")
   id("java-gradle-plugin")
@@ -10,8 +16,6 @@ apolloLibrary(
     jvmTarget = 11 // AGP requires 11
 )
 
-// Configuration for extra jar to pass to R8 to give it more context about what can be relocated
-configurations.create("gr8Classpath")
 // Configuration dependencies that will be shadowed
 val shadeConfiguration = configurations.create("shade")
 
@@ -19,15 +23,7 @@ val shadeConfiguration = configurations.create("shade")
 val relocateJar = System.getenv("APOLLO_RELOCATE_JAR")?.toBoolean() ?: true
 
 dependencies {
-  /**
-   * OkHttp has some bytecode that checks for Conscrypt at runtime (https://github.com/square/okhttp/blob/71427d373bfd449f80178792fe231f60e4c972db/okhttp/src/main/kotlin/okhttp3/internal/platform/ConscryptPlatform.kt#L59)
-   * Put this in the classpath so that R8 knows it can relocate DisabledHostnameVerifier as the superclass is not package-private
-   *
-   * Keep in sync with https://github.com/square/okhttp/blob/71427d373bfd449f80178792fe231f60e4c972db/buildSrc/src/main/kotlin/deps.kt#L24
-   */
-  add("gr8Classpath", "org.conscrypt:conscrypt-openjdk-uber:2.5.2")
-
-  add("shade", project(":apollo-gradle-plugin-external"))
+  add(shadeConfiguration.name, project(":apollo-gradle-plugin-external"))
 
   testImplementation(project(":apollo-ast"))
   testImplementation(libs.junit)
@@ -49,60 +45,101 @@ dependencies {
 }
 
 if (relocateJar) {
-  gr8 {
-    val shadowedJar = create("shadow") {
-      proguardFile("rules.pro")
-      configuration("shade")
-      classPathConfiguration("gr8Classpath")
+  val embeddedJarFile = file("build/r8/embedded.jar")
+  val relocatedJarFile = file("build/r8/relocated.jar")
+  val mappingFile = file("build/r8/mapping.txt")
+  val r8Version = "8.8.19"
+  val rulesFile = file("rules.pro")
 
-      exclude(".*MANIFEST.MF")
-      exclude("META-INF/versions/9/module-info\\.class")
-      exclude("META-INF/kotlin-stdlib.*\\.kotlin_module")
-
-      // Remove the following error:
-      // /Users/mbonnin/.m2/repository/com/apollographql/apollo/apollo-gradle-plugin/3.3.3-SNAPSHOT/apollo-gradle-plugin-3.3.3-SNAPSHOT.jar!/META-INF/kotlinpoet.kotlin_module:
-      // Module was compiled with an incompatible version of Kotlin. The binary version of its metadata is 1.7.1,
-      // expected version is 1.5.1.
-      exclude("META-INF/kotlinpoet.kotlin_module")
-
-      //Remove the following error:
-      // /Users/mbonnin/git/test-gradle-7-4/src/main/kotlin/Main.kt: (2, 5): Class 'kotlin.Unit' was compiled
-      // with an incompatible version of Kotlin. The binary version of its metadata is 1.7.1, expected version
-      // is 1.5.1.
-      exclude("kotlin/Unit.class")
-
-      // Remove proguard rules from dependencies, we'll manage them ourselves
-      exclude("META-INF/proguard/.*")
-
-      systemClassesToolchain {
-        languageVersion.set(JavaLanguageVersion.of(8))
+  val embeddedJarTaskProvider = tasks.register("embedJar", Zip::class) {
+    /**
+     * TODO: configuration cache
+     */
+    from(shadeConfiguration.elements.map { fileSystemLocations ->
+      files().apply {
+        fileSystemLocations.forEach {
+          from(zipTree(it.asFile))
+        }
       }
+    }) {
+      exclude("module-info.class")
+      exclude("META-INF/versions/*/module-info.class")
     }
 
-    // The java-gradle-plugin adds `gradleApi()` to the `api` implementation but it contains some JDK15 bytecode at
-    // org/gradle/internal/impldep/META-INF/versions/15/org/bouncycastle/jcajce/provider/asymmetric/edec/SignatureSpi$EdDSA.class:
-    // java.lang.IllegalArgumentException: Unsupported class file major version 59
-    // So remove it
-    val apiDependencies = project.configurations.getByName("api").dependencies
-    apiDependencies.firstOrNull {
-      it is FileCollectionDependency
-    }.let {
-      apiDependencies.remove(it)
-    }
+    // The jar is mostly empty but this is needed for the plugin descriptor + module-info
+    from(tasks.jar.map { zipTree(it.outputs.files.singleFile) })
 
-    configurations.named("compileOnly").configure {
-      extendsFrom(shadeConfiguration)
-    }
-    configurations.named("testImplementation").configure {
-      extendsFrom(shadeConfiguration)
-    }
+    /*
+     * Exclude libraries R8 rules, we'll add them ourselves
+     */
+    exclude(
+        "META-INF/MANIFEST.MF",
+        "META-INF/**/*.pro"
+    )
 
-    replaceOutgoingJar2(shadowedJar)
+    duplicatesStrategy = DuplicatesStrategy.WARN
+
+    destinationDirectory.set(embeddedJarFile.parentFile)
+    archiveFileName.set(embeddedJarFile.name)
   }
+
+  val gr8Configuration = configurations.create("gr8") {
+    isCanBeResolved = true
+  }
+
+  gr8Configuration.dependencies.add(dependencies.create("com.android.tools:r8:$r8Version"))
+
+  val relocatedJarTaskProvider = tasks.register("relocateJar", JavaExec::class) {
+    val javaHome = javaToolchainService().compilerFor {
+      languageVersion.set(JavaLanguageVersion.of(8))
+    }.get().metadata.installationPath.asFile.absolutePath
+
+    dependsOn(embeddedJarTaskProvider)
+    classpath(gr8Configuration)
+
+    inputs.file(rulesFile)
+    mainClass.set("com.android.tools.r8.R8")
+
+    args("--release")
+    args("--classfile")
+    args("--output")
+    args(relocatedJarFile.absolutePath)
+    args("--pg-map-output")
+    args(mappingFile.absolutePath)
+    args("--pg-conf")
+    args(rulesFile.absolutePath)
+    args("--lib")
+    args(javaHome)
+
+    args(embeddedJarFile.absolutePath)
+  }
+
+  configurations.named("compileOnly").configure {
+    extendsFrom(shadeConfiguration)
+  }
+  configurations.named("testImplementation").configure {
+    extendsFrom(shadeConfiguration)
+  }
+
+  replaceOutgoingJar2(relocatedJarTaskProvider.map { relocatedJarFile })
 } else {
   configurations.named("implementation").configure {
     extendsFrom(shadeConfiguration)
   }
+}
+
+fun RepositoryHandler.r8ReleasesRaw() {
+  maven("https://storage.googleapis.com/r8-releases/raw/") {
+    content {
+      onlyForConfigurations("gr8")
+    }
+  }
+}
+
+abstract class Holder @Inject constructor(val service: JavaToolchainService)
+
+fun javaToolchainService(): JavaToolchainService {
+  return objects.newInstance(Holder::class.java).service
 }
 
 fun replaceOutgoingJar2(newJar: Any) {
